@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import queue
 from unittest.mock import MagicMock, patch
 
@@ -21,16 +23,20 @@ from ouroboros.pricing import (
 @pytest.fixture(autouse=True)
 def _reset_pricing_cache():
     import ouroboros.pricing as pricing
+    from ouroboros import pricing_catalog
 
-    pricing._cached_pricing.clear()
-    pricing._pricing_fetched_at.clear()
-    pricing._pricing_retry_after.clear()
-    pricing._pricing_fetch_in_progress.clear()
+    def clear():
+        pricing._cached_pricing.clear()
+        pricing._pricing_fetched_at.clear()
+        pricing._pricing_retry_after.clear()
+        pricing._pricing_fetch_in_progress.clear()
+        pricing_catalog._cache.clear()
+        pricing_catalog._retry_after.clear()
+        pricing_catalog._fetching.clear()
+
+    clear()
     yield
-    pricing._cached_pricing.clear()
-    pricing._pricing_fetched_at.clear()
-    pricing._pricing_retry_after.clear()
-    pricing._pricing_fetch_in_progress.clear()
+    clear()
 
 
 def test_unknown_direct_model_cost_is_none_and_does_not_query_openrouter():
@@ -387,3 +393,86 @@ def test_legacy_empty_mode_preserves_its_model_price_and_cache_ratio():
     with patch("ouroboros.llm.fetch_openrouter_pricing", return_value={"vendor/model": (2.0, None, 3.0, 8.0)}):
         assert estimate_cost_optional("vendor/model", 1000, 100,
             cache_usage={"cache_write_tokens": 500, "prompt_cache_ttl": "1h"}) == 0.0042
+
+
+def _catalog_stub(monkeypatch, entries):
+    """Seed the public tariff catalogue without network I/O (the live-stack pattern)."""
+    from ouroboros import pricing_catalog
+    from ouroboros.utils import utc_now_iso
+
+    raw = json.dumps(entries)
+    pricing_catalog._cache_path(None).unlink(missing_ok=True)
+    monkeypatch.setattr(pricing_catalog, "_fetch_catalog", lambda: pricing_catalog._decode(dict(
+        url=pricing_catalog.CATALOG_URL, content=raw, fetched_at=utc_now_iso(),
+        sha256=hashlib.sha256(raw.encode()).hexdigest())))
+
+
+def test_direct_text_route_prices_its_exact_catalog_entry(monkeypatch):
+    _catalog_stub(monkeypatch, {"gigachat/GigaChat-3-Ultra": {
+        "litellm_provider": "gigachat", "input_cost_per_token": 1.17127e-06,
+        "output_cost_per_token": 3.51306e-06, "cache_read_input_token_cost": 1.17127e-06}})
+    cost = estimate_cost_optional("gigachat::GigaChat-3-Ultra", 1_000_000, 500_000, provider="gigachat")
+    assert cost == pytest.approx(1.17127 + 1.75653)
+    assert cost.quote["catalog_id"] == "gigachat/GigaChat-3-Ultra"
+    assert cost.quote["fetched_at"]
+
+
+def test_direct_text_catalog_reads_cache_tokens_at_the_published_rate(monkeypatch):
+    _catalog_stub(monkeypatch, {"deepseek/deepseek-v4-flash": {
+        "litellm_provider": "deepseek", "input_cost_per_token": 3e-07,
+        "output_cost_per_token": 1.2e-06, "cache_read_input_token_cost": 6e-09}})
+    cost = estimate_cost_optional("deepseek::deepseek-v4-flash", 1_000_000, 0,
+                                  cache_usage={"cached_tokens": 1_000_000}, provider="deepseek")
+    assert cost == pytest.approx(0.006)
+
+
+def test_direct_text_catalog_without_a_rate_keeps_the_call_unknown(monkeypatch):
+    _catalog_stub(monkeypatch, {"deepseek/deepseek-v4-flash": {
+        "litellm_provider": "deepseek", "input_cost_per_token": 3e-07, "output_cost_per_token": 1.2e-06}})
+    # Cached tokens without a published cache-read rate are unknown, never free work.
+    assert estimate_cost_optional("deepseek::deepseek-v4-flash", 1_000, 10,
+                                  cache_usage={"cached_tokens": 500}, provider="deepseek") is None
+
+
+def test_catalog_never_borrows_another_provider_or_model(monkeypatch):
+    from ouroboros.pricing_catalog import catalog_id
+
+    _catalog_stub(monkeypatch, {"gigachat/GigaChat-3-Ultra": {
+        "litellm_provider": "gigachat", "input_cost_per_token": 1e-06, "output_cost_per_token": 2e-06}})
+    assert estimate_cost_optional("gigachat::GigaChat-9", 1_000, 10, provider="gigachat") is None
+    assert estimate_cost_optional("deepseek::deepseek-v4-flash", 1_000, 10, provider="deepseek") is None
+    assert catalog_id("GigaChat-3-Ultra", "gigachat") == "gigachat/GigaChat-3-Ultra"
+    assert catalog_id("deepseek/deepseek-v4-flash", "deepseek") == "deepseek/deepseek-v4-flash"
+    assert catalog_id("deepseek/GigaChat-3-Ultra", "gigachat") is None
+    assert catalog_id("gigachat::GigaChat-3-Ultra", "deepseek") is None
+    assert catalog_id("GigaChat-3-Ultra", "openrouter") is None
+
+
+def test_a_catalog_entry_with_another_provider_label_is_refused(monkeypatch):
+    _catalog_stub(monkeypatch, {"gigachat/GigaChat-3-Ultra": {
+        "litellm_provider": "openai", "input_cost_per_token": 1e-06, "output_cost_per_token": 2e-06}})
+    assert estimate_cost_optional("gigachat::GigaChat-3-Ultra", 1_000, 10, provider="gigachat") is None
+
+
+def test_price_source_names_the_cached_row_only(monkeypatch):
+    from ouroboros.pricing import price_source
+
+    _catalog_stub(monkeypatch, {"gigachat/GigaChat-3-Lightning": {
+        "litellm_provider": "gigachat", "input_cost_per_token": 1e-07, "output_cost_per_token": 2e-07}})
+    # Warm the cache the way a settled call does (one live fetch), then the display reads it.
+    assert estimate_cost_optional("gigachat::GigaChat-3-Lightning", 100, 10, provider="gigachat")
+    assert price_source("gigachat", model="GigaChat-3-Lightning") == "catalog"
+    assert price_source("gigachat", model="GigaChat-404") == "unknown"
+    assert price_source("gigachat") == "unknown"  # no model named: the row cannot be proven
+
+
+def test_a_zero_row_without_a_published_source_is_unknown_not_free(monkeypatch):
+    _catalog_stub(monkeypatch, {
+        "gigachat/GigaChat-2-Max": {"litellm_provider": "gigachat", "input_cost_per_token": 0.0,
+                                     "output_cost_per_token": 0.0},
+        "gigachat/GigaChat-2-Free": {"litellm_provider": "gigachat", "input_cost_per_token": 0.0,
+                                      "output_cost_per_token": 0.0,
+                                      "source": "https://example.test/published-pricing"}})
+    assert estimate_cost_optional("gigachat::GigaChat-2-Max", 1_000, 10, provider="gigachat") is None
+    free = estimate_cost_optional("gigachat::GigaChat-2-Free", 1_000, 10, provider="gigachat")
+    assert free == 0.0 and free.quote["catalog_id"] == "gigachat/GigaChat-2-Free"

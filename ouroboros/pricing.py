@@ -77,9 +77,11 @@ def get_pricing(
 ) -> Dict[str, Tuple[Optional[float], ...]]:
     """Return pricing from the exact provider route's live catalog.
 
-    Direct/OpenAI-compatible/GigaChat routes have no automatic catalog here and
-    therefore return an empty mapping. A cold/expired fetch is bounded to five
-    seconds; failures expose unknown pricing rather than a fabricated fallback.
+    Direct text routes (``gigachat``, ``deepseek``) are priced from the public
+    LiteLLM catalogue in ``estimate_cost_optional``; every other direct,
+    OpenAI-compatible or local route has no automatic catalog here and returns an
+    empty mapping. A cold/expired fetch is bounded to five seconds; failures expose
+    unknown pricing rather than a fabricated fallback.
     An exact OpenRouter model selects its endpoint-tagged tariff catalog lazily,
     sharing this cache's TTL and in-flight owner. It never fetches all endpoints.
     """
@@ -144,6 +146,10 @@ def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: in
       split, every write bills the reported tier — the pre-split behavior, never
       a loosened ratio.
 
+    A direct text route (``gigachat::``, ``deepseek::``) reads its exact entry from the public
+    LiteLLM catalogue (``pricing_catalog``): an absent route, model or required rate stays None,
+    and a priced amount is a ``CatalogCost`` carrying the quote it was derived from.
+
     A named ``processing_mode`` uses an OpenRouter endpoint-pool upper estimate
     with literal tier prices, including Standard fallback for Priority. It is
     not an exact endpoint quote; missing eligible tariffs keep the amount unknown.
@@ -174,7 +180,8 @@ def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: in
     model_pricing = get_pricing(provider=route, allow_live_fetch=allow_live_fetch)
     pricing = model_pricing.get(normalized)
     if not pricing:
-        return None
+        return _catalog_cost_optional(raw_model, route, prompt_tokens, completion_tokens, cache_usage,
+                                      allow_live_fetch=allow_live_fetch)
     return _cost_from_pricing(pricing, prompt_tokens, completion_tokens, cache_usage)
 
 
@@ -235,6 +242,62 @@ def _cost_from_pricing(pricing: tuple, prompt_tokens: int, completion_tokens: in
         return None
     cost = addends[0] + addends[1] + addends[2] + addends[3] + addends[4]  # the order the one expression added them in
     return cost if exact_cache_tiers else round(cost, 6)
+
+
+class CatalogCost(float):
+    """An estimated amount carrying the catalogue quote it was derived from.
+
+    ``_usage_settlement`` records ``getattr(cost, "quote", None)`` as the attempt's
+    ``tariff_quote``; a provider-catalog estimate has no such quote.
+    """
+
+    quote: Dict[str, Any]
+
+    def __new__(cls, value: float, quote: Dict[str, Any]) -> "CatalogCost":
+        instance = super().__new__(cls, value)
+        instance.quote = dict(quote)
+        return instance
+
+
+def _catalog_pricing(quote: Mapping[str, Any], prompt_tokens: int) -> Optional[tuple]:
+    """A catalogue entry as the estimator's four rates (input, cache read, cache write, output), per million
+    tokens: the catalogue publishes per-token prices while ``_cost_addends`` answers a per-million tuple."""
+    from ouroboros.pricing_catalog import RATE_FIELDS, rate
+
+    def per_million(value: Optional[float]) -> Optional[float]:
+        return None if value is None else value * 1_000_000
+
+    input_price = rate(quote, RATE_FIELDS["text_input_tokens"], input_tokens=prompt_tokens)
+    output_price = rate(quote, RATE_FIELDS["text_output_tokens"], input_tokens=prompt_tokens)
+    if input_price is None or output_price is None:
+        return None
+    published_source = str((quote.get("entry") or {}).get("source") or "").strip()
+    if input_price == 0 and output_price == 0 and not published_source:
+        return None  # a 0.0 row with no published source is unknown, never free
+    return (per_million(input_price),
+            per_million(rate(quote, RATE_FIELDS["cached_text_input_tokens"], input_tokens=prompt_tokens)),
+            per_million(rate(quote, "cache_creation_input_token_cost", input_tokens=prompt_tokens)),
+            per_million(output_price))
+
+
+def _catalog_cost_optional(model: str, provider: str, prompt_tokens: int, completion_tokens: int,
+                           cache_usage: Optional[Dict[str, Any]], *,
+                           allow_live_fetch: bool) -> Optional[CatalogCost]:
+    """Price a direct text route from the public LiteLLM catalogue; unknown stays None.
+
+    Rates are used literally (``exact_cache_tiers``): a cache-write rate the entry does not
+    publish leaves cache writes unknown, never free, and a sub-microdollar call keeps its amount.
+    """
+    from ouroboros.pricing_catalog import DIRECT_TEXT_PROVIDERS, get_catalog_quote
+
+    if provider not in DIRECT_TEXT_PROVIDERS:
+        return None
+    quote = get_catalog_quote(model, provider=provider, allow_live_fetch=allow_live_fetch)
+    pricing = _catalog_pricing(quote, prompt_tokens) if quote else None
+    if pricing is None:
+        return None
+    cost = _cost_from_pricing(pricing, prompt_tokens, completion_tokens, cache_usage, exact_cache_tiers=True)
+    return CatalogCost(cost, quote) if cost is not None else None
 
 
 COST_CLASSES = ("cache_write", "cache_read", "output", "uncached_input")
@@ -493,9 +556,10 @@ def emit_llm_usage_event(
         log.debug("Failed to put llm_usage event to queue", exc_info=True)
 
 
-def price_source(provider: Any, settings: Optional[Mapping[str, Any]] = None) -> str:
+def price_source(provider: Any, settings: Optional[Mapping[str, Any]] = None, *, model: str = "") -> str:
     """How a route's price is known: ``local`` (no charge), ``subscription`` (the plan's time, not money),
-    ``catalog`` (its provider's live catalog, ``get_pricing``) or ``unknown`` (a call adds nothing to known spend)."""
+    ``catalog`` (its provider's live catalog, ``get_pricing``, or the public LiteLLM entry naming its exact
+    model) or ``unknown`` (a call adds nothing to known spend)."""
     kind = str(provider or "").strip().lower()
     if kind in ("local", "claudexor"):
         return "local" if kind == "local" else "subscription"
@@ -511,6 +575,10 @@ def price_source(provider: Any, settings: Optional[Mapping[str, Any]] = None) ->
         keyed = (provider_has_credentials_in_settings("cloudru", dict(settings)) if settings is not None
                  else model_has_credentials("cloudru::"))
         return "catalog" if rate > 0 and keyed else "unknown"
+    from ouroboros.pricing_catalog import DIRECT_TEXT_PROVIDERS, get_catalog_quote
+    if kind in DIRECT_TEXT_PROVIDERS:
+        # A price DISPLAY names the row from this process's cached catalogue; it never fetches.
+        return "catalog" if model and get_catalog_quote(model, provider=kind, allow_live_fetch=False) else "unknown"
     return "catalog" if kind in CATALOG_PROVIDERS else "unknown"
 
 
@@ -574,7 +642,9 @@ def known_spend_gaps(settings: Mapping[str, Any], subagents: Any = None) -> List
     no known price (``all model roles`` when none of the configured ones has), the first leg of built-in web
     search, and enabled API helpers (``Agents``; ``subagents`` is the resolved list, else the document's)."""
     def unpriced(model: str, local: bool) -> bool:
-        return bool(model) and price_source("local" if local else parse_model_route(model).kind, settings) == "unknown"
+        return bool(model) and price_source(
+            "local" if local else parse_model_route(model).kind, settings, model=model,
+        ) == "unknown"
 
     routed = [(label, _role_routes(settings, role)) for role, label in _SPEND_ROLES]
     routed = [(label, routes) for label, routes in routed if any(model for model, _ in routes)]

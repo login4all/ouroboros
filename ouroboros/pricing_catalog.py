@@ -26,6 +26,9 @@ from ouroboros.utils import atomic_write_json, utc_now_iso
 CATALOG_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 CACHE_REL = pathlib.Path("state/pricing/litellm.json")
 DIRECT_PROVIDERS = {"gemini_live": "gemini", "openai_realtime": "openai", "grok_realtime": "xai"}
+# Direct text routes the public catalogue publishes under "<provider>/<model>" keys beside its
+# own "litellm_provider" slug. A route absent here stays unknown: no provider borrows another row.
+DIRECT_TEXT_PROVIDERS = {"gigachat": "gigachat", "deepseek": "deepseek"}
 RATE_FIELDS = {
     "text_input_tokens": "input_cost_per_token",
     "text_output_tokens": "output_cost_per_token",
@@ -45,22 +48,30 @@ _retry_after: dict[pathlib.Path, float] = {}
 _fetching: set[pathlib.Path] = set()
 
 
+def _catalog_label(provider: str) -> str | None:
+    """The catalogue's own provider slug for a route, or None when it does not price it."""
+    return DIRECT_PROVIDERS.get(provider) or DIRECT_TEXT_PROVIDERS.get(provider)
+
+
 def catalog_id(model: str, provider: str) -> str | None:
     """Translate route syntax only; ids and provider identity remain exact."""
-    if provider not in DIRECT_PROVIDERS:
+    label = _catalog_label(provider)
+    if label is None:
         return None
     name = str(model or "").strip()
+    aliases = {"gemini_live": "google", "grok_realtime": "grok"}
     if "::" in name:
         owner, name = name.split("::", 1)
-        if owner not in {provider, DIRECT_PROVIDERS[provider], {"gemini_live": "google", "grok_realtime": "grok"}.get(provider, "")}:
+        if owner not in {provider, label, aliases.get(provider, "")}:
             return None
     if "/" in name:
         owner, name = name.split("/", 1)
-        if owner not in {provider, DIRECT_PROVIDERS[provider]} or "/" in name:
+        if owner not in {provider, label} or "/" in name:
             return None
     if not name:
         return None
-    return f"{DIRECT_PROVIDERS[provider]}/{name}" if provider in {"gemini_live", "grok_realtime"} else name
+    # Realtime routes keep the catalogue's bare/aliased key; direct text routes share its own prefix.
+    return f"{label}/{name}" if provider in {"gemini_live", "grok_realtime", *DIRECT_TEXT_PROVIDERS} else name
 
 
 def _cache_path(drive_root) -> pathlib.Path:
@@ -137,12 +148,13 @@ def _snapshot(*, drive_root=None, allow_live_fetch: bool = True) -> dict | None:
 
 def get_catalog_quote(model: str, *, provider: str, drive_root=None,
                       allow_live_fetch: bool = True) -> dict | None:
+    label = _catalog_label(provider)
     entry_id = catalog_id(model, provider)
-    if entry_id is None:
+    if label is None or entry_id is None:
         return None
     snapshot = _snapshot(drive_root=drive_root, allow_live_fetch=allow_live_fetch)
     entry = snapshot["entries"].get(entry_id) if snapshot else None
-    if not isinstance(entry, dict) or entry.get("litellm_provider") != DIRECT_PROVIDERS[provider]:
+    if not isinstance(entry, dict) or entry.get("litellm_provider") != label:
         return None
     return {"url": CATALOG_URL, "fetched_at": snapshot["fetched_at"], "sha256": snapshot["sha256"],
             "catalog_id": entry_id, "provider": provider, "entry": copy.deepcopy(entry)}
